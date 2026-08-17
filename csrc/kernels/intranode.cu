@@ -108,7 +108,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      int num_tokens, const bool* is_token_in_rank, int* channel_prefix_matrix,
                      int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
                      void** buffer_ptrs, int** barrier_signal_ptrs, int rank,
-                     cudaStream_t stream, int num_channels) {
+                     cudaStream_t stream, int num_channels, bool channel_prefix_precomputed) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(ranks) \
     LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, \
         num_tokens_per_rank, moe_recv_counter_mapped, \
@@ -122,7 +122,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads);
 
-    SETUP_LAUNCH_CONFIG(1 + num_ranks, kNumThreads, stream);
+    SETUP_LAUNCH_CONFIG(channel_prefix_precomputed ? 1 : 1 + num_ranks, kNumThreads, stream);
     SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
 #undef NOTIFY_DISPATCH_LAUNCH_CASE
 }
@@ -166,6 +166,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
          int* send_head, const int4* x, const float* x_scales, const float* sf_scale_for_nvfp4, const int64_t* topk_idx, const float* topk_weights,
          const bool* is_token_in_rank, const int* channel_prefix_matrix,
+         const int* channel_offsets, const int* channel_token_indices,
          int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales, int num_sf_scales_for_nvfp4,
          int scale_token_stride, int scale_hidden_stride, int sf_scale_for_nvfp4_token_stride, int sf_scale_for_nvfp4_hidden_stride,
          void** buffer_ptrs, int rank,
@@ -259,11 +260,12 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 
         // Get tasks
         int token_start_idx, token_end_idx;
-        get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
+        get_channel_task_range(num_tokens, num_channels, responsible_channel,
+                               channel_offsets, token_start_idx, token_end_idx);
 
         // Iterate over all tokens and send by chunks
         int cached_channel_tail_idx = 0;
-        for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; ) {
+        for (int64_t token_position = token_start_idx; token_position < token_end_idx; ) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
@@ -284,14 +286,16 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             __syncwarp();
 
             int chunk_token_idx = 0;
-            while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
+            while (chunk_token_idx < num_max_send_tokens and token_position < token_end_idx) {
+                int token_idx = get_channel_token_idx(
+                    static_cast<int>(token_position), channel_token_indices);
                 // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the following data
                 if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
                     send_head[token_idx * kNumRanks + responsible_rank] = is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
 
                 // Skip if not selected
                 if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
-                    token_idx ++;
+                    token_position ++;
                     continue;
                 }
 
@@ -338,7 +342,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 }
 
                 // Move token index
-                chunk_token_idx ++, token_idx ++;
+                chunk_token_idx ++, token_position ++;
             }
 
             // Move tail index
@@ -488,6 +492,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
               int* send_head, const void* x, const float* x_scales, const float* sf_scale_for_nvfp4, const int64_t* topk_idx, const float* topk_weights,
               const bool* is_token_in_rank, const int* channel_prefix_matrix,
+              const int* channel_offsets, const int* channel_token_indices,
               int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales, int num_sf_scales_for_nvfp4,
               int scale_token_stride, int scale_hidden_stride, int sf_scale_for_nvfp4_token_stride, int sf_scale_for_nvfp4_hidden_stride,
               void** buffer_ptrs, int rank, int num_ranks,
@@ -508,7 +513,7 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
     LAUNCH_KERNEL(&cfg, kernel, \
         reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
         send_head, reinterpret_cast<const int4*>(x), x_scales, sf_scale_for_nvfp4, topk_idx, topk_weights, \
-        is_token_in_rank, channel_prefix_matrix, \
+        is_token_in_rank, channel_prefix_matrix, channel_offsets, channel_token_indices, \
         num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, num_sf_scales_for_nvfp4, \
         scale_token_stride, scale_hidden_stride, sf_scale_for_nvfp4_token_stride, sf_scale_for_nvfp4_hidden_stride, \
         buffer_ptrs, rank, \
@@ -525,6 +530,7 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
 template<int kNumRanks>
 __global__ void
 cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int,
+                      const int* channel_offsets, const int* channel_token_indices,
                       int** barrier_signal_ptrs, int rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     if (sm_id == 0) {
@@ -549,14 +555,21 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
             return;
 
         int token_start_idx, token_end_idx;
-        get_channel_task_range(num_recv_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+        get_channel_task_range(num_recv_tokens, num_channels, channel_id,
+                               channel_offsets, token_start_idx, token_end_idx);
 
         // NOTES: `1 << 25` is a heuristic large number
         int last_head = 1 << 25;
         #pragma unroll
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
-            int token_idx = token_idx_tail - lane_id, expected_head = 0;
-            auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
+            int token_position = token_idx_tail - lane_id;
+            int token_idx = token_position >= token_start_idx
+                ? get_channel_token_idx(token_position, channel_token_indices)
+                : -1;
+            int expected_head = 0;
+            auto current_head = (token_position >= token_start_idx)
+                ? __ldg(send_head + token_idx * kNumRanks + rank_id)
+                : -1;
             for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++ i) {
                 const int head = __shfl_sync(0xffffffff, current_head, i);
                 if (head < 0) {
@@ -566,7 +579,7 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
                     last_head = head;
                 }
             }
-            if (current_head < 0 and token_idx >= token_start_idx)
+            if (current_head < 0 and token_position >= token_start_idx)
                 send_head[token_idx * kNumRanks + rank_id] = expected_head;
         }
     }
@@ -574,11 +587,13 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
 
 void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
                            int num_recv_tokens, int num_memset_int,
+                           const int* channel_offsets, const int* channel_token_indices,
                            int** barrier_signal_ptrs, int rank, int num_ranks,
                            cudaStream_t stream) {
 #define CACHED_NOTIFY_COMBINE(ranks) \
     LAUNCH_KERNEL(&cfg, cached_notify_combine<ranks>, \
-        buffer_ptrs, send_head, num_channels, num_recv_tokens, num_memset_int, barrier_signal_ptrs, rank); \
+        buffer_ptrs, send_head, num_channels, num_recv_tokens, num_memset_int, \
+        channel_offsets, channel_token_indices, barrier_signal_ptrs, rank); \
     break
 
     const int num_threads = std::max(128, 32 * num_ranks);
@@ -596,6 +611,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         const dtype_t* x, const float* topk_weights,
         const dtype_t* bias_0, const dtype_t* bias_1,
         const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
+        const int* channel_offsets, const int* channel_token_indices,
         int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
         void** buffer_ptrs, int rank,
         int num_max_send_tokens, int num_recv_buffer_tokens) {
@@ -780,10 +796,15 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
             // The same tokens as the dispatch process
             int token_start_idx, token_end_idx;
-            get_channel_task_range(num_recv_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
+            get_channel_task_range(num_recv_tokens, num_channels, responsible_channel,
+                                   channel_offsets, token_start_idx, token_end_idx);
 
             // Iterate over all tokens and combine
-            for (int64_t token_idx = token_start_idx + recv_warp_id - 1; token_idx < token_end_idx; token_idx += num_recv_warps - 1) {
+            for (int64_t token_position = token_start_idx + recv_warp_id - 1;
+                 token_position < token_end_idx;
+                 token_position += num_recv_warps - 1) {
+                int token_idx = get_channel_token_idx(
+                    static_cast<int>(token_position), channel_token_indices);
                 // Read expected head
                 int expected_head = -1;
                 if (lane_id < kNumRanks)
@@ -910,6 +931,7 @@ void combine(cudaDataType_t type,
              const void* x, const float* topk_weights,
              const void* bias_0, const void* bias_1,
              const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
+             const int* channel_offsets, const int* channel_token_indices,
              int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
              void** buffer_ptrs, int rank, int num_ranks,
              cudaStream_t stream, int num_sms,
@@ -927,7 +949,7 @@ void combine(cudaDataType_t type,
         reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
         reinterpret_cast<const dtype*>(x), topk_weights,   \
         reinterpret_cast<const dtype*>(bias_0), reinterpret_cast<const dtype*>(bias_1), \
-        src_idx, rank_prefix_matrix, channel_prefix_matrix, \
+        src_idx, rank_prefix_matrix, channel_prefix_matrix, channel_offsets, channel_token_indices, \
         send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
         buffer_ptrs, rank, \
         num_max_send_tokens, num_recv_buffer_tokens); } \

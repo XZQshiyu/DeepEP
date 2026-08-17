@@ -229,8 +229,14 @@ def get_extension_deep_ep_cpp():
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable',
                  '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
-    include_dirs = ['csrc/']
+    sources = [
+        'csrc/deep_ep.cpp',
+        'csrc/kernels/runtime.cu',
+        'csrc/kernels/layout.cu',
+        'csrc/kernels/channel_schedule.cu',
+        'csrc/kernels/intranode.cu',
+    ]
+    include_dirs = ['csrc/', '/usr/local/cuda/include/cccl/']
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = ['-lcuda']

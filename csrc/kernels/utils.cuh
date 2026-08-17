@@ -428,6 +428,26 @@ __forceinline__ __device__ void get_channel_task_range(int num_tokens, int num_s
     token_end_idx = min(token_start_idx + num_tokens_per_sm, num_tokens);
 }
 
+__forceinline__ __device__ void get_channel_task_range(
+        int num_tokens, int num_channels, int channel_id,
+        const int* channel_offsets,
+        int& token_start_idx, int& token_end_idx) {
+    if (channel_offsets == nullptr) {
+        get_channel_task_range(num_tokens, num_channels, channel_id,
+                               token_start_idx, token_end_idx);
+        return;
+    }
+    token_start_idx = __ldg(channel_offsets + channel_id);
+    token_end_idx = __ldg(channel_offsets + channel_id + 1);
+}
+
+__forceinline__ __device__ int get_channel_token_idx(
+        int token_position, const int* channel_token_indices) {
+    return channel_token_indices == nullptr
+        ? token_position
+        : __ldg(channel_token_indices + token_position);
+}
+
 template <typename dtype_a_t, typename dtype_b_t>
 __device__ __forceinline__ dtype_b_t pack2(const dtype_a_t& x, const dtype_a_t& y) {
     EP_STATIC_ASSERT(sizeof(dtype_a_t) * 2 == sizeof(dtype_b_t), "Invalid dtypes");

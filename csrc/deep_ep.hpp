@@ -150,21 +150,24 @@ public:
     get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event,
                         bool async, bool allocate_on_comm_stream);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<EventHandle>>
     intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
                        const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
                        const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
                        int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                       const std::optional<torch::Tensor>& cached_channel_offsets, const std::optional<torch::Tensor>& cached_channel_token_indices,
                        int expert_alignment, int num_worst_tokens, const Config& config, bool use_nvfp4, const std::optional<torch::Tensor>& sf_scale_for_nvfp4,
-                       std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
+                       bool use_channel_schedule, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     intranode_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& topk_weights,
                       const std::optional<torch::Tensor>& bias_0, const std::optional<torch::Tensor>& bias_1,
                       const torch::Tensor& src_idx, const torch::Tensor& rank_prefix_matrix, const torch::Tensor& channel_prefix_matrix,
-                      const torch::Tensor& send_head, const Config& config, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
+                      const torch::Tensor& send_head, const std::optional<torch::Tensor>& channel_offsets,
+                      const std::optional<torch::Tensor>& channel_token_indices,
+                      const Config& config, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<EventHandle>>
     internode_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
                        const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
                        const std::optional<torch::Tensor>& num_tokens_per_rank, const std::optional<torch::Tensor>& num_tokens_per_rdma_rank,
@@ -172,7 +175,8 @@ public:
                        int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
                        const std::optional<torch::Tensor>& cached_rdma_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_rdma_rank_prefix_sum,
                        const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
-                       int expert_alignment, const Config& config,
+                       const std::optional<torch::Tensor>& cached_channel_offsets, const std::optional<torch::Tensor>& cached_channel_token_indices,
+                       int expert_alignment, const Config& config, bool use_channel_schedule,
                        std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
@@ -197,6 +201,7 @@ public:
                       const torch::Tensor& src_meta, const torch::Tensor& is_combined_token_in_rank,
                       const torch::Tensor& rdma_channel_prefix_matrix, const torch::Tensor& rdma_rank_prefix_sum, const torch::Tensor& gbl_channel_prefix_matrix,
                       const torch::Tensor& combined_rdma_head, const torch::Tensor& combined_nvl_head,
+                      const std::optional<torch::Tensor>& channel_offsets, const std::optional<torch::Tensor>& channel_token_indices,
                       const Config& config, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);

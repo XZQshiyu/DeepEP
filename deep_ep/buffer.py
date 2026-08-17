@@ -29,6 +29,7 @@ class Buffer:
     """
 
     num_sms: int = 20
+    channel_schedule_enabled: bool = False
 
     def __init__(self, group: Optional[dist.ProcessGroup],
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
@@ -159,6 +160,12 @@ class Buffer:
 
         assert new_num_sms % 2 == 0, 'The SM count must be even'
         Buffer.num_sms = new_num_sms
+
+    @staticmethod
+    def set_channel_schedule_enabled(enabled: bool) -> None:
+        """Enable destination-aware channel scheduling for normal-mode dispatch/combine."""
+
+        Buffer.channel_schedule_enabled = bool(enabled)
 
     @staticmethod
     def capture() -> EventOverlap:
@@ -391,24 +398,30 @@ class Buffer:
             x, x_scales = x, None
         if handle is not None:
             assert topk_idx is None and topk_weights is None
-            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
+            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, \
+                is_token_in_rank, send_head, channel_offsets, channel_token_indices = handle
             num_recv_tokens = recv_src_idx.size(0)
-            recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
+            recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4, _, _, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
                 x, x_scales, None, None,
                 None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
+                channel_offsets, channel_token_indices,
                 expert_alignment, num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4,
+                Buffer.channel_schedule_enabled,
                 getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             if x_scales is not None:
                 recv_x = (recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4) if use_nvfp4 else (recv_x, recv_x_scales)
             return recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
+            recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, channel_offsets, channel_token_indices, event = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
+                                                None, None,
                                                 expert_alignment, num_worst_tokens, config, use_nvfp4, sf_scale_for_nvfp4,
+                                                Buffer.channel_schedule_enabled,
                                                 getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
-            handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
+            handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
+                      is_token_in_rank, send_head, channel_offsets, channel_token_indices)
             if x_scales is not None:
                 recv_x = (recv_x, recv_x_scales, recv_x_sf_scale_for_nvfp4) if use_nvfp4 else (recv_x, recv_x_scales)
             return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(event)
@@ -455,13 +468,15 @@ class Buffer:
             return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
-        rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
+        rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head, \
+            channel_offsets, channel_token_indices = handle
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
         recv_x, recv_topk_weights, event = self.runtime.intranode_combine(
             x, topk_weights, bias_0, bias_1,
-            src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head, config,
+            src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
+            channel_offsets, channel_token_indices, config,
             getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
         return recv_x, recv_topk_weights, EventOverlap(event)
 
@@ -565,15 +580,17 @@ class Buffer:
             is_token_in_rank, \
                 rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
-                recv_src_meta, send_rdma_head, send_nvl_head = handle
+                recv_src_meta, send_rdma_head, send_nvl_head, channel_offsets, channel_token_indices = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights,
                 None, None, is_token_in_rank, None,
                 num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
-                expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                channel_offsets, channel_token_indices,
+                expert_alignment, config, Buffer.channel_schedule_enabled,
+                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -581,15 +598,17 @@ class Buffer:
                 rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                 recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
-                recv_src_meta, send_rdma_head, send_nvl_head, event = self.runtime.internode_dispatch(
+                recv_src_meta, send_rdma_head, send_nvl_head, channel_offsets, channel_token_indices, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
-                expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                None, None,
+                expert_alignment, config, Buffer.channel_schedule_enabled,
+                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             handle = (is_token_in_rank,
                       rdma_channel_prefix_matrix, gbl_channel_prefix_matrix,
                       recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
-                      recv_src_meta, send_rdma_head, send_nvl_head)
+                      recv_src_meta, send_rdma_head, send_nvl_head, channel_offsets, channel_token_indices)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(event)
 
     # noinspection PyTypeChecker
@@ -610,7 +629,7 @@ class Buffer:
         is_combined_token_in_rank, \
             _, _, \
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, gbl_rank_prefix_sum, \
-            src_meta, send_rdma_head, send_nvl_head = handle
+            src_meta, send_rdma_head, send_nvl_head, channel_offsets, channel_token_indices = handle
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
@@ -618,7 +637,8 @@ class Buffer:
             x, topk_weights, bias_0, bias_1,
             src_meta, is_combined_token_in_rank,
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
-            send_rdma_head, send_nvl_head, config, getattr(previous_event, 'event', None),
+            send_rdma_head, send_nvl_head, channel_offsets, channel_token_indices,
+            config, getattr(previous_event, 'event', None),
             async_finish, allocate_on_comm_stream)
         return combined_x, combined_topk_weights, EventOverlap(event)
 

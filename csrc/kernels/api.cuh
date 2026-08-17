@@ -40,6 +40,24 @@ void get_dispatch_layout(const int64_t* topk_idx,
 
 } // namespace layout
 
+// Optional token-to-channel scheduler for normal-mode DeepEP.  The schedule
+// preserves original token identities while replacing contiguous row slicing.
+namespace channel_schedule {
+
+void build(const bool* is_token_in_rank,
+           int* channel_offsets,
+           int* channel_token_indices,
+           int* rank_channel_prefix,
+           int* rdma_channel_prefix,
+           void* workspace,
+           int num_tokens,
+           int num_ranks,
+           int num_channels,
+           int source_rank,
+           cudaStream_t stream);
+
+} // namespace channel_schedule
+
 // Intranode kernels
 namespace intranode {
 
@@ -48,7 +66,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      int num_tokens, const bool* is_token_in_rank, int* channel_prefix_matrix,
                      int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
                      void** buffer_ptrs, int** barrier_signal_ptrs, int rank,
-                     cudaStream_t stream, int num_sms);
+                     cudaStream_t stream, int num_sms, bool channel_prefix_precomputed);
 
 void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
                             void** buffer_ptrs, int** barrier_signal_ptrs, int rank, int num_ranks,
@@ -57,6 +75,7 @@ void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
 void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
               int* send_head, const void* x, const float* x_scales, const float* sf_scale_for_nvfp4, const int64_t* topk_idx, const float* topk_weights,
               const bool* is_token_in_rank, const int* channel_prefix_matrix,
+              const int* channel_offsets, const int* channel_token_indices,
               int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales, int num_sf_scales_for_nvfp4,
               int scale_token_stride, int scale_hidden_stride, int sf_scale_for_nvfp4_token_stride, int sf_scale_for_nvfp4_hidden_stride,
               void** buffer_ptrs, int rank, int num_ranks,
@@ -64,6 +83,7 @@ void dispatch(void* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvf
               int num_max_send_tokens, int num_recv_buffer_tokens);
 
 void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int,
+                           const int* channel_offsets, const int* channel_token_indices,
                            int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);
 
 void combine(cudaDataType_t type,
@@ -71,6 +91,7 @@ void combine(cudaDataType_t type,
              const void* x, const float* topk_weights,
              const void* bias_0, const void* bias_1,
              const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
+             const int* channel_offsets, const int* channel_token_indices,
              int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
              void** buffer_ptrs, int rank, int num_ranks,
              cudaStream_t stream, int num_sms,
@@ -94,7 +115,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
                      int** barrier_signal_ptrs, int rank,
                      cudaStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-                     bool low_latency_mode);
+                     bool low_latency_mode, bool channel_prefix_precomputed);
 
 void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, void* recv_src_meta,
               const void* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
@@ -103,6 +124,7 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
               const int* rdma_channel_prefix_matrix, const int* recv_rdma_rank_prefix_sum,
               const int* gbl_channel_prefix_matrix, const int* recv_gbl_rank_prefix_sum,
               const bool* is_token_in_rank,
+              const int* channel_offsets, const int* channel_token_indices,
               int num_tokens, int hidden_int4, int num_scales, int num_topk, int num_experts,
               int scale_token_stride, int scale_hidden_stride,
               void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
@@ -117,7 +139,8 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                    void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
                    int** barrier_signal_ptrs, int rank, cudaStream_t stream,
                    int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-                   bool is_cached_dispatch, bool low_latency_mode);
+                   bool is_cached_dispatch, bool low_latency_mode,
+                   const int* channel_offsets, const int* channel_token_indices);
 
 void combine(cudaDataType_t type,
              void* combined_x, float* combined_topk_weights,
@@ -126,6 +149,7 @@ void combine(cudaDataType_t type,
              const void* bias_0, const void* bias_1,
              const int* combined_rdma_head, const int* combined_nvl_head,
              const void* src_meta, const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, const int* gbl_channel_prefix_matrix,
+             const int* channel_offsets, const int* channel_token_indices,
              int num_tokens, int num_combined_tokens, int hidden, int num_topk,
              void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
              void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,

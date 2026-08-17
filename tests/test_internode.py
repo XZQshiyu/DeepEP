@@ -253,6 +253,7 @@ def test_main(args: argparse.Namespace, num_sms: int,
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    deep_ep.Buffer.set_channel_schedule_enabled(args.channel_schedule)
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
@@ -317,6 +318,8 @@ if __name__ == '__main__':
                        help='Number of experts (default: 256')
     parser.add_argument('--test-ll-compatibility', action='store_true',
                         help='whether to test compatibility with low-latency kernels')
+    parser.add_argument('--channel-schedule', action='store_true',
+                        help='Enable destination-aware token-to-channel scheduling')
     args = parser.parse_args()
 
     # Set default `num_topk_groups` if not provided

@@ -85,6 +85,19 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
             assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
             check_start = check_end
 
+    def canonicalize_received(tensor, current_handle):
+        """Order received rows by stable (source rank, source token) identity."""
+
+        rank_prefix_matrix, _, _, recv_src_idx = current_handle[:4]
+        pieces = []
+        start = 0
+        for source_rank in range(num_ranks):
+            end = rank_prefix_matrix[source_rank][rank].item()
+            order = torch.argsort(recv_src_idx[start:end])
+            pieces.append(tensor[start:end].index_select(0, order))
+            start = end
+        return torch.cat(pieces, dim=0)
+
     for previous_mode in (False, True):
         for async_mode in (False, True):
             for current_x in filter(lambda elem: elem is not None, (x_pure_rand, x, x_e4m3, x_e2m1)):
@@ -132,7 +145,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
                     if with_topk:
                         num_worst_tokens = num_tokens * num_ranks
                         dispatch_args.update({'num_worst_tokens': num_worst_tokens})
-                        recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = buffer.dispatch(**dispatch_args)
+                        recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, worst_handle, event = buffer.dispatch(**dispatch_args)
                         event.current_stream_wait() if async_mode else ()
                         if precision == "NVFP4":
                             recv_worst_x = dequantize_nvfp4_back_to_bfloat16(*recv_worst_x)
@@ -142,9 +155,29 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
                         assert num_worst_tokens == recv_worst_x.size(0)
                         assert num_worst_tokens == recv_worst_topk_idx.size(0)
                         assert num_worst_tokens == recv_worst_topk_weights.size(0)
-                        assert torch.equal(recv_x, recv_worst_x[:recv_x.size(0)])
-                        assert torch.equal(recv_topk_idx, recv_worst_topk_idx[:recv_x.size(0)])
-                        assert torch.equal(recv_topk_weights_clone, recv_worst_topk_weights[:recv_x.size(0)])
+                        if args.channel_schedule:
+                            assert torch.equal(
+                                canonicalize_received(recv_x, handle),
+                                canonicalize_received(
+                                    recv_worst_x[:recv_x.size(0)], worst_handle
+                                ),
+                            )
+                            assert torch.equal(
+                                canonicalize_received(recv_topk_idx, handle),
+                                canonicalize_received(
+                                    recv_worst_topk_idx[:recv_x.size(0)], worst_handle
+                                ),
+                            )
+                            assert torch.equal(
+                                canonicalize_received(recv_topk_weights_clone, handle),
+                                canonicalize_received(
+                                    recv_worst_topk_weights[:recv_x.size(0)], worst_handle
+                                ),
+                            )
+                        else:
+                            assert torch.equal(recv_x, recv_worst_x[:recv_x.size(0)])
+                            assert torch.equal(recv_topk_idx, recv_worst_topk_idx[:recv_x.size(0)])
+                            assert torch.equal(recv_topk_weights_clone, recv_worst_topk_weights[:recv_x.size(0)])
                         assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
 
                     # Test cached dispatch (must without top-k staffs)
@@ -259,6 +292,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    deep_ep.Buffer.set_channel_schedule_enabled(args.channel_schedule)
     test_ll_compatibility, num_rdma_bytes = False, 0
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
@@ -302,6 +336,8 @@ if __name__ == '__main__':
                         help='Enable MNNVL support')
     parser.add_argument('--use-fabric', action="store_true",
                         help='Enable fabric mode')
+    parser.add_argument('--channel-schedule', action='store_true',
+                        help='Enable destination-aware token-to-channel scheduling')
     args = parser.parse_args()
 
     num_processes = args.num_processes
