@@ -8,6 +8,12 @@ namespace deep_ep {
 
 namespace intranode {
 
+// `send_head` normally stores a channel-queue sequence number.  Exact-local
+// dispatches never enter that queue; tag their final `recv_x` row instead so
+// combine can consume the local contribution directly from its input tensor.
+constexpr int kLocalDirectHeadFlag = 1 << 30;
+constexpr int kLocalDirectHeadMask = kLocalDirectHeadFlag - 1;
+
 template<int kNumRanks>
 __global__ void
 notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
@@ -245,16 +251,30 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
         const auto send_thread_id = thread_id;
         const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / 32;
+        const bool is_local_direct = responsible_rank == rank;
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
 
+        // Received rows are source-major, then channel-major.  The local
+        // sender can therefore derive the final row without consulting the
+        // receiver queue.
+        auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
+        const int local_rank_offset = rank > 0
+            ? rank_prefix_matrix[(rank - 1) * kNumRanks + rank]
+            : 0;
+        const int local_channel_offset = responsible_channel > 0
+            ? channel_prefix_matrix[rank * num_channels + responsible_channel - 1]
+            : 0;
+
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (send_warp_id_in_rank == 0 and elect_one_sync()) {
+        if (not is_local_direct and send_warp_id_in_rank == 0 and elect_one_sync()) {
             int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
             st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
             st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
+        } else if (is_local_direct and send_warp_id_in_rank == 0 and elect_one_sync()) {
+            recv_channel_offset[rank * num_channels + responsible_channel] = local_channel_offset;
         }
         __syncwarp();
 
@@ -269,7 +289,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            if (elect_one_sync()) {
+            if (not is_local_direct and elect_one_sync()) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                     int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
@@ -290,11 +310,18 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 int token_idx = get_channel_token_idx(
                     static_cast<int>(token_position), channel_token_indices);
                 // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the following data
-                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
-                    send_head[token_idx * kNumRanks + responsible_rank] = is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
+                const bool selected = is_token_in_rank[token_idx * kNumRanks + responsible_rank];
+                const int local_recv_idx = local_rank_offset + local_channel_offset + cached_channel_tail_idx;
+                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync()) {
+                    send_head[token_idx * kNumRanks + responsible_rank] = selected
+                        ? (is_local_direct
+                            ? kLocalDirectHeadFlag | local_recv_idx
+                            : cached_channel_tail_idx)
+                        : -1;
+                }
 
                 // Skip if not selected
-                if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
+                if (not selected) {
                     token_position ++;
                     continue;
                 }
@@ -303,13 +330,15 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                 int dst_slot_idx = (cached_channel_tail_idx ++) % num_recv_buffer_tokens;
                 if (cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank) {
                     // Copy data
-                    auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
+                    auto shifted_dst_x = is_local_direct
+                        ? recv_x + static_cast<int64_t>(local_recv_idx) * hidden_int4
+                        : channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_dst_x, shifted_x, __ldg, st_na_global);
 
                     // Copy source index
                     if (elect_one_sync())
-                        channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
+                        (is_local_direct ? recv_src_idx[local_recv_idx] : channel_src_idx_buffers[dst_slot_idx]) = static_cast<int>(token_idx);
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
                     if (lane_id < num_topk) {
@@ -317,26 +346,41 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
                         int recv_expert_begin = responsible_rank * num_experts_per_rank, recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
                         auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
-                        channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] = idx_value;
+                        auto metadata_idx = (is_local_direct ? local_recv_idx : dst_slot_idx) * num_topk + lane_id;
+                        if (is_local_direct)
+                            recv_topk_idx[metadata_idx] = idx_value;
+                        else
+                            channel_topk_idx_buffers[metadata_idx] = idx_value;
 
                         // Top-k weights
                         auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
                         weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = weight_value;
+                        if (is_local_direct)
+                            recv_topk_weights[metadata_idx] = weight_value;
+                        else
+                            channel_topk_weights_buffers[metadata_idx] = weight_value;
                     }
 
                     // Copy `x_scales`
                     #pragma unroll
                     for (int i = lane_id; i < num_scales; i += 32) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                        channel_x_scales_buffers[dst_slot_idx * num_scales + i] = __ldg(x_scales + offset);
+                        auto value = __ldg(x_scales + offset);
+                        if (is_local_direct)
+                            recv_x_scales[static_cast<int64_t>(local_recv_idx) * num_scales + i] = value;
+                        else
+                            channel_x_scales_buffers[dst_slot_idx * num_scales + i] = value;
                     }
 
                     // Copy `sf_scale_for_nvfp4`
                     #pragma unroll
                     for (int i = lane_id; i < num_sf_scales_for_nvfp4; i += 32) {
                         auto offset = token_idx * sf_scale_for_nvfp4_token_stride + i * sf_scale_for_nvfp4_hidden_stride;
-                        channel_x_sf_scale_for_nvfp4_buffers[dst_slot_idx * num_sf_scales_for_nvfp4 + i] = __ldg(sf_scale_for_nvfp4 + offset);
+                        auto value = __ldg(sf_scale_for_nvfp4 + offset);
+                        if (is_local_direct)
+                            recv_x_sf_scale_for_nvfp4[static_cast<int64_t>(local_recv_idx) * num_sf_scales_for_nvfp4 + i] = value;
+                        else
+                            channel_x_sf_scale_for_nvfp4_buffers[dst_slot_idx * num_sf_scales_for_nvfp4 + i] = value;
                     }
 
                 }
@@ -347,9 +391,11 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
-            if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+            if (not is_local_direct) {
+                asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
+                if (send_warp_id_in_rank == 0 and elect_one_sync())
+                    st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+            }
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -361,6 +407,9 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
+        // The exact-local source was written directly by its sender block.
+        // All remote sources retain the original receiver-queue path.
+        if (responsible_rank != rank) {
         // Calculate offset first
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
@@ -474,6 +523,7 @@ dispatch(int4* recv_x, float* recv_x_scales, float* recv_x_sf_scale_for_nvfp4, i
             // Exit
             num_tokens_to_recv -= num_recv_tokens;
         }
+        }
     }
 
     // Clean unused `recv_topk_idx` as -1
@@ -551,7 +601,9 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
         const auto thread_id = static_cast<int>(threadIdx.x);
         const auto rank_id = thread_id / 32;
         const auto lane_id = thread_id % 32;
-        if (rank_id >= kNumRanks)
+        // Exact-local heads encode final `recv_x` rows and never participate
+        // in the combine queue, so they need no missing-head repair.
+        if (rank_id >= kNumRanks or rank_id == rank)
             return;
 
         int token_start_idx, token_end_idx;
@@ -649,6 +701,9 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         const auto send_warp_id_in_rank = send_warp_id / kNumRanks;
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
+        // Exact-local rows already live in `x` at their final dispatch slots;
+        // only remote source ranks need the receiver-side combine queue.
+        if (send_rank_id != rank) {
         // Calculate pointers by the specific layout
         auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
         auto num_channels_total = num_channels * kNumRanks;
@@ -723,6 +778,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
+        }
     } else {
         // Workers for receiving
         // One warp for moving the queue head, others for reduction
@@ -749,7 +805,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
             // Queue head updater
             int last_head = 0;
-            while (lane_id < kNumRanks) {
+            while (lane_id < kNumRanks and lane_id != rank) {
                 // Check retired
                 bool retired = true;
                 #pragma unroll
@@ -809,9 +865,12 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 int expected_head = -1;
                 if (lane_id < kNumRanks)
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
+                const bool is_local_direct = lane_id == rank and expected_head >= 0 and
+                                             (expected_head & kLocalDirectHeadFlag) != 0;
 
                 auto start_time = clock64();
-                while (__any_sync(0xffffffff, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
+                while (__any_sync(0xffffffff, not is_local_direct and
+                                  channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
                     // Timeout check
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n", rank, responsible_channel, expected_head);
@@ -826,7 +885,10 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 for (int i = 0; i < kNumRanks; ++ i) {
                     auto expected_head_i = __shfl_sync(0xffffffff, expected_head, i);
                     if (expected_head_i >= 0) {
-                        slot_indices[num_topk_ranks] = expected_head_i % num_recv_buffer_tokens;
+                        slot_indices[num_topk_ranks] = i == rank and
+                            (expected_head_i & kLocalDirectHeadFlag) != 0
+                            ? expected_head_i & kLocalDirectHeadMask
+                            : expected_head_i % num_recv_buffer_tokens;
                         topk_ranks[num_topk_ranks ++] = i;
                     }
                 }
@@ -850,8 +912,11 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     // Read buffers
                     int4 recv_value_int4[kNumRanks];
                     #pragma unroll
-                    for (int j = 0; j < num_topk_ranks; ++ j)
-                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
+                    for (int j = 0; j < num_topk_ranks; ++ j) {
+                        recv_value_int4[j] = topk_ranks[j] == rank
+                            ? ld_nc_global(x_int4 + static_cast<int64_t>(slot_indices[j]) * hidden_int4 + i)
+                            : ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
+                    }
 
                     // Reduce bias
                     float values[kDtypePerInt4];
@@ -908,13 +973,16 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 if (lane_id < num_topk) {
                     float value = 0;
                     #pragma unroll
-                    for (int i = 0; i < num_topk_ranks; ++ i)
-                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
+                    for (int i = 0; i < num_topk_ranks; ++ i) {
+                        value += topk_ranks[i] == rank
+                            ? ld_nc_global(topk_weights + static_cast<int64_t>(slot_indices[i]) * num_topk + lane_id)
+                            : ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
+                    }
                     recv_topk_weights[token_idx * num_topk + lane_id] = value;
                 }
 
                 // Update head
-                if (lane_id < kNumRanks)
+                if (lane_id < kNumRanks and lane_id != rank)
                     warp_channel_head_idx[recv_warp_id][lane_id] = (expected_head < 0) ? -expected_head - 1 : expected_head + 1;
             }
 
